@@ -2,12 +2,13 @@
 // Designed for Seeed XIAO RP2040
 // This sketch sets up random action triggering after random delays.
 // This version reads the ICM-42688-P accelerometer and gyroscope manually via I2C
-// and initializes an OLED display via I2C.
+// and initializes an OLED display via I2C, and implements a gravity simulation.
 
 // --- Includes ---
 #include <Wire.h> // Required for I2C communication
 #include <Adafruit_GFX.h> // Core graphics library
 #include <Adafruit_SSD1306.h> // Hardware-specific library for the OLED
+#include <math.h> // For the atan2 function to calculate tilt
 
 // --- Global Variables ---
 unsigned long previousMillis = 0;   // Stores last time an action was triggered
@@ -33,7 +34,6 @@ const int GYRO_CONFIG0_RATE_12_5_HZ = 0b01100000; // 12.5 Hz ODR
 const int TEMP_DATA0 = 0x1F;
 
 // Button Pin Definitions
-// These pins are connected to buttons with external pull-down resistors
 const int BUTTON_ADDPEEP_PIN = 27; // GP27 / A1 on the XIAO RP2040
 const int BUTTON_RESET_PIN = 26;   // GP26 / A0 on the XIAO RP2040
 
@@ -41,24 +41,81 @@ const int BUTTON_RESET_PIN = 26;   // GP26 / A0 on the XIAO RP2040
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
 #define OLED_RESET -1 // Reset pin # (or -1 if sharing Arduino reset pin)
-const int OLED_I2C_ADDR = 0x3C; // The datasheet gives 0x78, which is the 8-bit address. The 7-bit is 0x3C.
+const int OLED_I2C_ADDR = 0x3C;
 
 // Create an instance of the OLED display object
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
+// --- Game State Machine ---
+// Define the different states our game can be in.
+enum GameState {
+  IDLE,
+  BUG_SCENARIO_WAIT,
+  BUG_SCENARIO_STOMP,
+  DOG_SCENARIO_LICK_WALK,
+  DOG_SCENARIO_BITE_RUNIN,
+  DOG_SCENARIO_BITE_BITTEN,
+  DOG_SCENARIO_BITE_RUNOUT,
+  DOG_SCENARIO_BITE_RUNBACKIN,
+  DOG_SCENARIO_BITE_JUMP,
+  PERSON_SCENARIO_RUNIN,
+  PERSON_SCENARIO_FIGHT,
+  PERSON_SCENARIO_DRAG,
+  PERSON_SCENARIO_FRIENDS
+};
+GameState currentGameState = IDLE;
+
+// --- Object State Variables ---
+int characterX = SCREEN_WIDTH / 2;
+int characterY = 40;
+int characterDirection = 1; // 1 for right, -1 for left
+
+int bugX, bugY;
+int dogX, dogY;
+int person2X, person2Y;
+
+// For fight scenario
+int punchCount = 0;
+const int MAX_PUNCHES = 10;
+const int MIN_PUNCHES = 5;
+
+// --- Gravity & Tilt Variables ---
+float tiltAngle = 0.0;     // The raw tilt angle from the accelerometer
+int tiltRating = 0;      // The user-defined tilt rating (3-36)
+float gravity = 0.0;     // The force of "gravity" (sliding speed)
+int gravityX = 0;        // The X component of the gravity vector
+int gravityY = 1;        // The Y component of the gravity vector
+
 // --- Function Prototypes ---
-void actionA();
-void actionB();
-void actionC();
-void actionD();
-void actionE();
+// Motion functions
+void drawCharacter(int x, int y, int direction, bool hasBiteMarks);
+void drawMeditating();
+void drawReading();
+void drawThinking();
+void drawWaving();
+void drawLiftingWeights();
+void drawBug(int x, int y);
+void drawDog(int x, int y);
+void drawPerson2(int x, int y, bool isKnockedOut);
+void drawStompEffect(int x, int y);
+void drawDogLick(int x, int y, int direction);
+void drawCharacterHoldingDog(int x, int y, int direction);
+
+// Scenario handling functions
+void handleBugScenario();
+void handleDogLickScenario();
+void handleDogBiteScenario();
+void handlePersonFightScenario();
+void handlePersonFriendsScenario();
 void resetGame();
 
+// Core helper functions
 void setRandomInterval();
 void triggerRandomAction();
 void configureICM42688();
 void readSensorData();
 void checkButtons();
+void handleGravity();
 
 // --- Setup Function ---
 void setup() {
@@ -68,23 +125,23 @@ void setup() {
   }
   Serial.println("Cube World Firmware Starting...");
 
-  randomSeed(analogRead(A0)); 
+  randomSeed(analogRead(A0));
 
   // --- Initialize I2C, Accelerometer, and OLED ---
-  Wire.begin(); // Start I2C bus on the XIAO RP2040 (SDA=GP6, SCL=GP7)
-  
+  Wire.begin();
+
   configureICM42688();
 
-  // Initialize the OLED display
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR)) {
     Serial.println(F("SSD1306 allocation failed"));
-    for (;;); // Don't proceed, loop forever
+    for (;;);
   }
-  
-  // Clear the buffer and show the splash screen (default behavior)
+
   display.display();
-  delay(2000); // Pause for 2 seconds
-  display.clearDisplay(); // Clear the buffer after the splash screen
+  delay(2000);
+
+  drawCharacter(characterX, characterY, characterDirection, false);
+
   Serial.println("OLED Display Initialized.");
 
   // --- Initialize Buttons ---
@@ -98,23 +155,53 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
 
-  // Check for the timed action trigger
-  if (currentMillis - previousMillis >= interval) {
-    previousMillis = currentMillis;
-
-    triggerRandomAction();
-    setRandomInterval();
+  // Handle timed actions when in IDLE state
+  if (currentGameState == IDLE) {
+    if (currentMillis - previousMillis >= interval) {
+      previousMillis = currentMillis;
+      triggerRandomAction();
+      setRandomInterval();
+    }
   }
-  
+
+  // Handle active scenarios
+  switch (currentGameState) {
+    case BUG_SCENARIO_WAIT:
+    case BUG_SCENARIO_STOMP:
+      handleBugScenario();
+      break;
+    case DOG_SCENARIO_LICK_WALK:
+      handleDogLickScenario();
+      break;
+    case DOG_SCENARIO_BITE_RUNIN:
+    case DOG_SCENARIO_BITE_BITTEN:
+    case DOG_SCENARIO_BITE_RUNOUT:
+    case DOG_SCENARIO_BITE_RUNBACKIN:
+    case DOG_SCENARIO_BITE_JUMP:
+      handleDogBiteScenario();
+      break;
+    case PERSON_SCENARIO_RUNIN:
+    case PERSON_SCENARIO_FIGHT:
+    case PERSON_SCENARIO_DRAG:
+      handlePersonFightScenario();
+      break;
+    case PERSON_SCENARIO_FRIENDS:
+      handlePersonFriendsScenario();
+      break;
+    default:
+      break;
+  }
+
   readSensorData();
+  handleGravity(); // Apply gravity to all entities
   checkButtons();
-  
+
+  // The delay is important for display updates and avoiding flickering.
   delay(50);
 }
 
 // --- Helper Functions ---
 
-// Sets a new random interval for the next action.
 void setRandomInterval() {
   interval = random(5000, 10001);
   Serial.print("Next action in: ");
@@ -122,34 +209,34 @@ void setRandomInterval() {
   Serial.println(" ms");
 }
 
-// Triggers one of the defined action functions randomly.
 void triggerRandomAction() {
   int actionChoice = random(0, 5);
 
-  Serial.print("Triggering action: ");
+  Serial.print("Triggering random action: ");
   switch (actionChoice) {
     case 0:
-      Serial.println("Action A!");
-      actionA();
+      Serial.println("Meditating");
+      drawMeditating();
       break;
     case 1:
-      Serial.println("Action B!");
-      actionB();
+      Serial.println("Reading");
+      drawReading();
       break;
     case 2:
-      Serial.println("Action C!");
-      actionC();
+      Serial.println("Thinking");
+      drawThinking();
       break;
     case 3:
-      Serial.println("Action D!");
-      actionD();
+      Serial.println("Waving");
+      drawWaving();
       break;
     case 4:
-      Serial.println("Action E!");
-      actionE();
+      Serial.println("Lifting Weights");
+      drawLiftingWeights();
       break;
     default:
-      Serial.println("Unknown action choice!");
+      Serial.println("Initial Pose");
+      drawCharacter(characterX, characterY, characterDirection, false);
       break;
   }
 }
@@ -157,25 +244,22 @@ void triggerRandomAction() {
 // Manually configures the ICM-42688-P via I2C register writes.
 void configureICM42688() {
   Serial.println("Configuring ICM42688-P...");
-  
-  // Power up the sensor and set to low-noise mode for accel and gyro
-  Wire.beginTransmission(ICM_ADDR);
-  Wire.write(PWR_MGMT0); // Register address
-  Wire.write(PWR_MGMT0_MODE_LN); // Data to write
-  Wire.endTransmission();
-  delay(100); // Give the sensor time to power up
 
-  // Configure accelerometer range and data rate
   Wire.beginTransmission(ICM_ADDR);
-  Wire.write(ACCEL_CONFIG0); // Register address
-  Wire.write(ACCEL_CONFIG0_RATE_12_5_HZ | ACCEL_CONFIG0_RANGE_4G); // Data to write
+  Wire.write(PWR_MGMT0);
+  Wire.write(PWR_MGMT0_MODE_LN);
   Wire.endTransmission();
   delay(100);
 
-  // Configure gyroscope range and data rate
   Wire.beginTransmission(ICM_ADDR);
-  Wire.write(GYRO_CONFIG0); // Register address
-  Wire.write(GYRO_CONFIG0_RATE_12_5_HZ | GYRO_CONFIG0_RANGE_500DPS); // Data to write
+  Wire.write(ACCEL_CONFIG0);
+  Wire.write(ACCEL_CONFIG0_RATE_12_5_HZ | ACCEL_CONFIG0_RANGE_4G);
+  Wire.endTransmission();
+  delay(100);
+
+  Wire.beginTransmission(ICM_ADDR);
+  Wire.write(GYRO_CONFIG0);
+  Wire.write(GYRO_CONFIG0_RATE_12_5_HZ | GYRO_CONFIG0_RANGE_500DPS);
   Wire.endTransmission();
   delay(100);
 
@@ -184,101 +268,632 @@ void configureICM42688() {
 
 // Manually reads the accelerometer and gyroscope data from the sensor.
 void readSensorData() {
-  // Raw 16-bit values from sensor
   int16_t accelX, accelY, accelZ, gyroX, gyroY, gyroZ;
-
-  // Start a read sequence
   Wire.beginTransmission(ICM_ADDR);
-  Wire.write(TEMP_DATA0); // Start reading from the Temp data register
-  Wire.endTransmission(false); // Do not send a stop bit, this is a repeated start condition
-  
-  // Request 14 bytes of data (2 for temp, 6 for accel, 6 for gyro)
+  Wire.write(TEMP_DATA0);
+  Wire.endTransmission(false);
   Wire.requestFrom(ICM_ADDR, 14);
 
   if (Wire.available() == 14) {
-    // Read and discard temp data (2 bytes)
-    Wire.read(); 
     Wire.read();
-    
-    // Read Accel X (high byte, then low byte)
+    Wire.read();
     accelX = Wire.read() << 8 | Wire.read();
-    // Read Accel Y
     accelY = Wire.read() << 8 | Wire.read();
-    // Read Accel Z
     accelZ = Wire.read() << 8 | Wire.read();
-
-    // Read Gyro X
     gyroX = Wire.read() << 8 | Wire.read();
-    // Read Gyro Y
     gyroY = Wire.read() << 8 | Wire.read();
-    // Read Gyro Z
     gyroZ = Wire.read() << 8 | Wire.read();
 
-    // --- Convert raw values to physical units ---
-    // The scale factor for +/- 4G range is 16384 LSB/g
     float accelX_g = accelX / 16384.0;
     float accelY_g = accelY / 16384.0;
     float accelZ_g = accelZ / 16384.0;
-    
-    // The scale factor for +/- 500 DPS range is 65.5 LSB/dps
+
     float gyroX_dps = gyroX / 65.5;
     float gyroY_dps = gyroY / 65.5;
     float gyroZ_dps = gyroZ / 65.5;
 
-    // Print acceleration data
-    Serial.print("Accel X: ");
-    Serial.print(accelX_g, 2);
-    Serial.print(" g, Y: ");
-    Serial.print(accelY_g, 2);
-    Serial.print(" g, Z: ");
-    Serial.print(accelZ_g, 2);
+    // --- New Gravity and Tilt Logic ---
+    // Use atan2 to get the angle from the accelerometer data
+    // The angle will be in radians, convert to degrees
+    tiltAngle = atan2(-accelX_g, accelY_g) * 180.0 / PI;
+
+    // Ensure the angle is positive and wraps around from 360
+    if (tiltAngle < 0) {
+      tiltAngle += 360;
+    }
+
+    // Map the angle to the user's defined tilt rating
+    tiltRating = floor(tiltAngle / 10.0);
+    if (tiltRating > 36) {
+        tiltRating = 36;
+    }
+    
+    // Set a "no rotation" dead zone for tilt ratings 0-3
+    if (tiltRating < 3) {
+      gravity = 0.0;
+    } else {
+      // Scale the gravity force based on the tilt rating
+      gravity = (float)(tiltRating - 2) / 8.0; 
+      if (gravity > 1.0) gravity = 1.0;
+    }
+
+    // Determine the direction of gravity based on the angle
+    // A simplified model to find the "down" direction
+    if (tiltAngle >= 315 || tiltAngle < 45) { // Down
+        gravityX = 0; gravityY = 1;
+    } else if (tiltAngle >= 45 && tiltAngle < 135) { // Right
+        gravityX = 1; gravityY = 0;
+    } else if (tiltAngle >= 135 && tiltAngle < 225) { // Up
+        gravityX = 0; gravityY = -1;
+    } else if (tiltAngle >= 225 && tiltAngle < 315) { // Left
+        gravityX = -1; gravityY = 0;
+    }
+
+    Serial.print("Tilt Angle: "); Serial.print(tiltAngle);
+    Serial.print(" degrees, Tilt Rating: "); Serial.print(tiltRating);
+    Serial.print(", Gravity: "); Serial.println(gravity, 2);
+    Serial.print("Accel X: "); Serial.print(accelX_g, 2);
+    Serial.print(" g, Y: "); Serial.print(accelY_g, 2);
+    Serial.print(" g, Z: "); Serial.print(accelZ_g, 2);
     Serial.println(" g");
-
-    // Print gyroscope data
-    Serial.print("Gyro X: ");
-    Serial.print(gyroX_dps, 2);
-    Serial.print(" dps, Y: ");
-    Serial.print(gyroY_dps, 2);
-    Serial.print(" dps, Z: ");
-    Serial.print(gyroZ_dps, 2);
+    Serial.print("Gyro X: "); Serial.print(gyroX_dps, 2);
+    Serial.print(" dps, Y: "); Serial.print(gyroY_dps, 2);
+    Serial.print(" dps, Z: "); Serial.print(gyroZ_dps, 2);
     Serial.println(" dps");
-
   } else {
     Serial.println("I2C read error!");
   }
 }
 
+// Applies gravity to the character and other entities
+void handleGravity() {
+    if (gravity > 0) {
+        // Character
+        characterX += gravity * gravityX;
+        characterY += gravity * gravityY;
+        
+        // Clamp character position to screen boundaries
+        if (characterX < 0) characterX = 0;
+        if (characterX > SCREEN_WIDTH-1) characterX = SCREEN_WIDTH-1;
+        if (characterY < 0) characterY = 0;
+        if (characterY > SCREEN_HEIGHT-1) characterY = SCREEN_HEIGHT-1;
+
+        // Note: For other entities like bug, dog, person2, their gravity needs to be
+        // implemented within their specific scenario handlers to avoid conflicts.
+        // The current implementation is a basic example for the main character.
+    }
+}
+
 // Checks the state of the buttons and performs actions.
 void checkButtons() {
-  // Debouncing is not included here for simplicity, but is recommended for real-world applications.
+  static unsigned long lastAddPeepPress = 0;
+  static unsigned long lastResetPress = 0;
+  const unsigned long debounceDelay = 50; // 50 ms debounce
+
+  // AddPeep button debouncing
   if (digitalRead(BUTTON_ADDPEEP_PIN) == HIGH) {
-    Serial.println("AddPeep button pressed!");
-    triggerRandomAction();
-    // A small delay to prevent rapid-fire triggering while the button is held down
-    delay(200); 
+    unsigned long now = millis();
+    if (now - lastAddPeepPress > debounceDelay) {
+      lastAddPeepPress = now;
+      Serial.println("AddPeep button pressed! Starting a new scenario...");
+      int scenarioChoice = random(0, 3); // 0=Bug, 1=Dog, 2=Person
+
+      if (currentGameState != IDLE) {
+          Serial.println("Cannot start new scenario, game is not IDLE.");
+          return;
+      }
+      
+      // Set initial state based on the random choice
+      if (scenarioChoice == 0) {
+          Serial.println("Spawning a bug!");
+          int bugSpawnSide = random(0, 2); // 0 = left, 1 = right
+          if (bugSpawnSide == 0) {
+              bugX = -10; // Start off-screen left
+              characterDirection = 1;
+          } else {
+              bugX = SCREEN_WIDTH + 10; // Start off-screen right
+              characterDirection = -1;
+          }
+          bugY = SCREEN_HEIGHT - 5;
+          currentGameState = BUG_SCENARIO_WAIT;
+      } else if (scenarioChoice == 1) {
+          Serial.println("Spawning a dog!");
+          int dogSpawnSide = random(0, 2); // 0 = left, 1 = right
+          if (dogSpawnSide == 0) {
+              dogX = -15; // Start off-screen left
+          } else {
+              dogX = SCREEN_WIDTH + 15; // Start off-screen right
+          }
+          dogY = SCREEN_HEIGHT - 10;
+          int dogInteraction = random(0, 2); // 0 = lick, 1 = bite
+          if (dogInteraction == 0) {
+              currentGameState = DOG_SCENARIO_LICK_WALK;
+          } else {
+              currentGameState = DOG_SCENARIO_BITE_RUNIN;
+          }
+      } else { // scenarioChoice == 2
+          Serial.println("Spawning a new person!");
+          int personSpawnSide = random(0, 2); // 0 = left, 1 = right
+          if (personSpawnSide == 0) {
+              person2X = -10;
+          } else {
+              person2X = SCREEN_WIDTH + 10;
+          }
+          person2Y = 40;
+          int personInteraction = random(0, 2); // 0 = fight, 1 = friends
+          if (personInteraction == 0) {
+              punchCount = random(MIN_PUNCHES, MAX_PUNCHES + 1);
+              currentGameState = PERSON_SCENARIO_RUNIN;
+          } else {
+              currentGameState = PERSON_SCENARIO_FRIENDS;
+          }
+      }
+    }
   }
-  
+
+  // Reset button debouncing
   if (digitalRead(BUTTON_RESET_PIN) == HIGH) {
-    Serial.println("Reset button pressed!");
-    resetGame();
-    // A small delay to prevent rapid-fire triggering while the button is held down
-    delay(200);
+    unsigned long now = millis();
+    if (now - lastResetPress > debounceDelay) {
+      lastResetPress = now;
+      Serial.println("Reset button pressed!");
+      resetGame();
+    }
   }
 }
 
-// --- Action Functions (Empty Placeholders) ---
-void actionA() {}
-void actionB() {}
-void actionC() {}
-void actionD() {}
-void actionE() {}
-
 // --- Game Logic Functions ---
+
+// Draws the stick figure in its default standing position.
+void drawCharacter(int x, int y, int direction, bool hasBiteMarks) {
+  display.clearDisplay();
+
+  // Head
+  display.drawCircle(x, y - 10, 6, SSD1306_WHITE);
+
+  // Body (Rectangle)
+  display.drawRect(x - 4, y - 4, 8, 18, SSD1306_WHITE);
+  
+  if (hasBiteMarks) {
+    display.drawCircle(x - 2, y + 2, 1, SSD1306_BLACK);
+    display.drawCircle(x + 2, y + 2, 1, SSD1306_BLACK);
+    display.drawCircle(x - 2, y + 6, 1, SSD1306_BLACK);
+    display.drawCircle(x + 2, y + 6, 1, SSD1306_BLACK);
+  }
+
+  // Arms
+  display.drawLine(x, y - 2, x - 12, y + 8, SSD1306_WHITE);
+  display.drawLine(x, y - 2, x + 12, y + 8, SSD1306_WHITE);
+
+  // Legs (Lines from body)
+  display.drawLine(x - 2, y + 14, x - 2, y + 28, SSD1306_WHITE);
+  display.drawLine(x + 2, y + 14, x + 2, y + 28, SSD1306_WHITE);
+
+  // Feet (Small horizontal lines)
+  display.drawLine(x - 5, y + 28, x + 1, y + 28, SSD1306_WHITE);
+  display.drawLine(x + 1, y + 28, x + 7, y + 28, SSD1306_WHITE);
+
+  display.display();
+}
+
 void resetGame() {
   Serial.println("--- Resetting Game State ---");
-  // Your game reset logic will go here.
-  // This could involve:
-  // - Clearing the OLED display
-  // - Resetting game variables (e.g., score, level)
-  // - Re-initializing game objects
+  currentGameState = IDLE;
+  characterX = SCREEN_WIDTH / 2;
+  characterY = 40;
+  characterDirection = 1;
+  drawCharacter(characterX, characterY, characterDirection, false);
+}
+
+void drawMeditating() {
+  display.clearDisplay();
+  // Head
+  display.drawCircle(SCREEN_WIDTH / 2, 12, 6, SSD1306_WHITE);
+  // Body (Rectangle)
+  display.drawRect(58, 18, 12, 14, SSD1306_WHITE);
+  // Arms
+  display.drawLine(60, 26, 62, 32, SSD1306_WHITE); // Left arm
+  display.drawLine(68, 26, 66, 32, SSD1306_WHITE); // Right arm
+  // Legs (Cross-legged)
+  display.drawCircle(64, 40, 8, SSD1306_WHITE);
+  display.display();
+}
+
+void drawReading() {
+  display.clearDisplay();
+  // Head
+  display.drawCircle(SCREEN_WIDTH / 2, 12, 6, SSD1306_WHITE);
+  // Body (Rectangle)
+  display.drawRect(60, 18, 8, 18, SSD1306_WHITE);
+  // Arms holding a book
+  display.drawLine(60, 24, 52, 32, SSD1306_WHITE);
+  display.drawLine(68, 24, 76, 32, SSD1306_WHITE);
+  // The book
+  display.drawRect(52, 32, 24, 16, SSD1306_WHITE);
+  // Legs
+  display.drawLine(62, 36, 62, 50, SSD1306_WHITE);
+  display.drawLine(66, 36, 66, 50, SSD1306_WHITE);
+  // Feet
+  display.drawLine(59, 50, 65, 50, SSD1306_WHITE);
+  display.drawLine(63, 50, 69, 50, SSD1306_WHITE);
+  display.display();
+}
+
+void drawThinking() {
+  display.clearDisplay();
+  // Head
+  display.drawCircle(SCREEN_WIDTH / 2, 12, 6, SSD1306_WHITE);
+  // Body (Rectangle)
+  display.drawRect(60, 18, 8, 18, SSD1306_WHITE);
+  // Left Arm (down)
+  display.drawLine(64, 20, 52, 30, SSD1306_WHITE);
+  // Right Arm (hand on head)
+  display.drawLine(64, 20, 70, 20, SSD1306_WHITE);
+  display.drawLine(70, 20, 70, 15, SSD1306_WHITE);
+  // Thought bubble
+  display.drawCircle(78, 8, 4, SSD1306_WHITE);
+  display.drawPixel(70, 12, SSD1306_WHITE);
+  display.drawPixel(74, 10, SSD1306_WHITE);
+  // Legs
+  display.drawLine(62, 36, 62, 50, SSD1306_WHITE);
+  display.drawLine(66, 36, 66, 50, SSD1306_WHITE);
+  // Feet
+  display.drawLine(59, 50, 65, 50, SSD1306_WHITE);
+  display.drawLine(63, 50, 69, 50, SSD1306_WHITE);
+  display.display();
+}
+
+void drawWaving() {
+  display.clearDisplay();
+  // Head
+  display.drawCircle(SCREEN_WIDTH / 2, 12, 6, SSD1306_WHITE);
+  // Body (Rectangle)
+  display.drawRect(60, 18, 8, 18, SSD1306_WHITE);
+  // Left Arm (raised)
+  display.drawLine(64, 20, 52, 10, SSD1306_WHITE);
+  // Right Arm (down)
+  display.drawLine(64, 20, 76, 30, SSD1306_WHITE);
+  // Legs
+  display.drawLine(62, 36, 62, 50, SSD1306_WHITE);
+  display.drawLine(66, 36, 66, 50, SSD1306_WHITE);
+  // Feet
+  display.drawLine(59, 50, 65, 50, SSD1306_WHITE);
+  display.drawLine(63, 50, 69, 50, SSD1306_WHITE);
+  display.display();
+}
+
+void drawLiftingWeights() {
+  display.clearDisplay();
+  // Head
+  display.drawCircle(SCREEN_WIDTH / 2, 12, 6, SSD1306_WHITE);
+  // Body (Rectangle)
+  display.drawRect(60, 18, 8, 18, SSD1306_WHITE);
+  // Arms holding a barbell
+  display.drawLine(64, 20, 64, 30, SSD1306_WHITE);
+  display.drawLine(64, 20, 64, 30, SSD1306_WHITE);
+  // Barbell
+  display.drawLine(50, 30, 78, 30, SSD1306_WHITE);
+  display.drawCircle(50, 30, 2, SSD1306_WHITE);
+  display.drawCircle(78, 30, 2, SSD1306_WHITE);
+  // Legs
+  display.drawLine(62, 36, 62, 50, SSD1306_WHITE);
+  display.drawLine(66, 36, 66, 50, SSD1306_WHITE);
+  // Feet
+  display.drawLine(59, 50, 65, 50, SSD1306_WHITE);
+  display.drawLine(63, 50, 69, 50, SSD1306_WHITE);
+  display.display();
+}
+
+void drawBug(int x, int y) {
+  display.drawPixel(x, y, SSD1306_WHITE);
+  display.drawPixel(x+1, y, SSD1306_WHITE);
+  display.drawPixel(x-1, y, SSD1306_WHITE);
+  display.drawPixel(x, y-1, SSD1306_WHITE);
+  display.drawPixel(x, y+1, SSD1306_WHITE);
+}
+
+void drawDog(int x, int y) {
+  display.fillRect(x, y, 10, 5, SSD1306_WHITE);
+  display.fillRect(x+10, y, 3, 3, SSD1306_WHITE); // Head
+}
+
+void drawPerson2(int x, int y, bool isKnockedOut) {
+  if (isKnockedOut) {
+    // Draw knocked out character
+    display.drawCircle(x, y + 10, 6, SSD1306_WHITE);
+    display.drawRect(x - 10, y + 16, 18, 8, SSD1306_WHITE);
+  } else {
+    drawCharacter(x, y, -1, false);
+  }
+}
+
+void drawStompEffect(int x, int y) {
+  display.fillCircle(x, y, 5, SSD1306_WHITE);
+}
+
+void drawDogLick(int x, int y, int direction) {
+  display.drawLine(x, y, x + (10 * direction), y, SSD1306_WHITE);
+}
+
+void drawCharacterHoldingDog(int x, int y, int direction) {
+  display.clearDisplay();
+  drawCharacter(x, y, direction, false);
+  drawDog(x + (15 * direction), y + 10);
+  display.display();
+}
+
+
+// --- Scenario Handlers ---
+
+void handleBugScenario() {
+  static bool bugSpawned = false;
+  static int bugDirection;
+  
+  if (!bugSpawned) {
+    bugDirection = (bugX < SCREEN_WIDTH / 2) ? 1 : -1;
+    characterDirection = bugDirection;
+    bugSpawned = true;
+    currentGameState = BUG_SCENARIO_WAIT;
+  }
+  
+  if (currentGameState == BUG_SCENARIO_WAIT) {
+    display.clearDisplay();
+    drawCharacter(characterX, characterY, characterDirection, false);
+    drawBug(bugX, bugY);
+    display.display();
+    
+    bugX += bugDirection;
+    
+    if (abs(bugX - characterX) < 10) {
+      currentGameState = BUG_SCENARIO_STOMP;
+      previousMillis = millis();
+    }
+  }
+  
+  if (currentGameState == BUG_SCENARIO_STOMP) {
+    display.clearDisplay();
+    drawCharacter(characterX, characterY, characterDirection, false);
+    drawStompEffect(bugX, bugY);
+    display.display();
+    
+    if (millis() - previousMillis > 500) {
+      bugSpawned = false;
+      resetGame();
+    }
+  }
+}
+
+void handleDogLickScenario() {
+  static int dogDirection = (dogX < SCREEN_WIDTH / 2) ? 1 : -1;
+  static int phase = 0;
+  static unsigned long lastUpdate = 0;
+  const int updateInterval = 100;
+
+  if (millis() - lastUpdate > updateInterval) {
+    lastUpdate = millis();
+
+    if (phase == 0) { // Dog runs in
+      display.clearDisplay();
+      drawCharacter(characterX, characterY, characterDirection, false);
+      drawDog(dogX, dogY);
+      display.display();
+      dogX += (5 * dogDirection);
+      if (abs(dogX - characterX) < 20) {
+        phase = 1;
+        lastUpdate = millis();
+      }
+    } else if (phase == 1) { // Lick
+      display.clearDisplay();
+      drawCharacter(characterX, characterY, characterDirection, false);
+      drawDog(dogX, dogY);
+      drawDogLick(dogX, dogY - 5, -dogDirection);
+      display.display();
+      if (millis() - lastUpdate > 1000) {
+        phase = 2;
+        lastUpdate = millis();
+      }
+    } else if (phase == 2) { // Pick up and walk
+      dogDirection = -dogDirection;
+      characterDirection = dogDirection;
+      drawCharacterHoldingDog(characterX, characterY, characterDirection);
+      characterX += (2 * characterDirection);
+      dogX = characterX + (15 * characterDirection);
+      if (characterX < -20 || characterX > SCREEN_WIDTH + 20) {
+        phase = 3;
+        lastUpdate = millis();
+      }
+    } else if (phase == 3) { // Throw
+      display.clearDisplay();
+      drawCharacter(characterX, characterY, characterDirection, false);
+      dogX += (10 * dogDirection);
+      drawDog(dogX, dogY);
+      display.display();
+      if (dogX < -20 || dogX > SCREEN_WIDTH + 20) {
+        phase = 4;
+      }
+    } else if (phase == 4) { // Reset
+      phase = 0;
+      resetGame();
+    }
+  }
+}
+
+void handleDogBiteScenario() {
+  static int dogDirection = (dogX < SCREEN_WIDTH / 2) ? 1 : -1;
+  static int phase = 0;
+  static unsigned long lastUpdate = 0;
+  const int updateInterval = 100;
+
+  if (millis() - lastUpdate > updateInterval) {
+    lastUpdate = millis();
+
+    if (phase == 0) { // Dog runs in
+      display.clearDisplay();
+      drawCharacter(characterX, characterY, characterDirection, false);
+      drawDog(dogX, dogY);
+      display.display();
+      dogX += (5 * dogDirection);
+      if (abs(dogX - characterX) < 10) {
+        phase = 1;
+        lastUpdate = millis();
+      }
+    } else if (phase == 1) { // Bites character
+      display.clearDisplay();
+      drawCharacter(characterX, characterY, characterDirection, true); // Bite marks
+      drawDog(dogX, dogY);
+      display.display();
+      if (millis() - lastUpdate > 1000) {
+        phase = 2;
+      }
+    } else if (phase == 2) { // Run off screen
+      characterDirection = -dogDirection;
+      display.clearDisplay();
+      drawCharacter(characterX, characterY, characterDirection, true);
+      drawDog(dogX, dogY);
+      display.display();
+      characterX += (5 * characterDirection);
+      dogX += (5 * characterDirection);
+      if (characterX < -20 || characterX > SCREEN_WIDTH + 20) {
+        phase = 3;
+        lastUpdate = millis();
+      }
+    } else if (phase == 3) { // Re-enter from other side
+      characterX = (characterDirection == 1) ? -20 : SCREEN_WIDTH + 20;
+      dogX = characterX + (10 * characterDirection);
+      phase = 4;
+      lastUpdate = millis();
+    } else if (phase == 4) { // Jump over dog
+      display.clearDisplay();
+      drawCharacter(characterX, characterY - 10, characterDirection, true); // Jump up
+      drawDog(dogX, dogY);
+      display.display();
+      dogX += (5 * characterDirection);
+      if (abs(characterX - dogX) < 10) { // If close to each other
+        phase = 5;
+      }
+    } else if (phase == 5) { // Dog runs off
+      display.clearDisplay();
+      drawCharacter(characterX, characterY, characterDirection, true);
+      drawDog(dogX, dogY);
+      display.display();
+      dogX += (5 * characterDirection);
+      if (dogX < -20 || dogX > SCREEN_WIDTH + 20) {
+        phase = 6;
+      }
+    } else if (phase == 6) { // Reset
+      phase = 0;
+      resetGame();
+    }
+  }
+}
+
+void handlePersonFightScenario() {
+  static int person2Direction;
+  static int phase = 0;
+  static unsigned long lastUpdate = 0;
+  const int updateInterval = 100;
+
+  if (millis() - lastUpdate > updateInterval) {
+    lastUpdate = millis();
+
+    if (phase == 0) { // Second person runs in
+      person2Direction = (person2X < SCREEN_WIDTH / 2) ? 1 : -1;
+      display.clearDisplay();
+      drawCharacter(characterX, characterY, characterDirection, false);
+      drawPerson2(person2X, person2Y, false);
+      display.display();
+      person2X += (5 * person2Direction);
+      if (abs(person2X - characterX) < 20) {
+        phase = 1;
+      }
+    } else if (phase == 1) { // Fight phase
+      display.clearDisplay();
+      // Draw punching animation
+      drawCharacter(characterX, characterY, characterDirection, false);
+      drawPerson2(person2X, person2Y, false);
+      display.display();
+      punchCount--;
+      if (punchCount <= 0) {
+        phase = 2;
+        lastUpdate = millis();
+      }
+    } else if (phase == 2) { // Knock out
+      display.clearDisplay();
+      drawPerson2(person2X, person2Y, false);
+      drawPerson2(characterX, characterY, true); // Knocked out
+      display.display();
+      if (millis() - lastUpdate > 1000) {
+        phase = 3;
+      }
+    } else if (phase == 3) { // Drag off-screen
+      display.clearDisplay();
+      drawPerson2(person2X, person2Y, false);
+      drawPerson2(characterX, characterY, true); // Knocked out
+      display.display();
+      person2X += (5 * person2Direction);
+      characterX += (5 * person2Direction);
+      if (person2X < -20 || person2X > SCREEN_WIDTH + 20) {
+        phase = 4;
+      }
+    } else if (phase == 4) { // Person 2 returns alone
+      person2X = (person2Direction == 1) ? -20 : SCREEN_WIDTH + 20;
+      display.clearDisplay();
+      drawPerson2(person2X, person2Y, false);
+      display.display();
+      if (person2X > SCREEN_WIDTH / 2 - 10 && person2X < SCREEN_WIDTH / 2 + 10) {
+        phase = 5;
+        lastUpdate = millis();
+      }
+    } else if (phase == 5) { // Reset
+      phase = 0;
+      resetGame();
+    }
+  }
+}
+
+void handlePersonFriendsScenario() {
+  static int person2Direction;
+  static int phase = 0;
+  static unsigned long lastUpdate = 0;
+  const int updateInterval = 100;
+
+  if (millis() - lastUpdate > updateInterval) {
+    lastUpdate = millis();
+
+    if (phase == 0) { // Second person runs in
+      person2Direction = (person2X < SCREEN_WIDTH / 2) ? 1 : -1;
+      display.clearDisplay();
+      drawCharacter(characterX, characterY, characterDirection, false);
+      drawPerson2(person2X, person2Y, false);
+      display.display();
+      person2X += (5 * person2Direction);
+      if (abs(person2X - characterX) < 20) {
+        phase = 1;
+        lastUpdate = millis();
+      }
+    } else if (phase == 1) { // High five
+      display.clearDisplay();
+      // Animate arms coming together
+      drawCharacter(characterX, characterY, characterDirection, false);
+      drawPerson2(person2X, person2Y, false);
+      display.display();
+      if (millis() - lastUpdate > 500) {
+        phase = 2;
+        lastUpdate = millis();
+      }
+    } else if (phase == 2) { // Person 2 gets thrown off screen
+      person2Direction = -person2Direction;
+      display.clearDisplay();
+      drawCharacter(characterX, characterY, characterDirection, false);
+      drawPerson2(person2X, person2Y, false);
+      display.display();
+      person2X += (10 * person2Direction);
+      if (person2X < -20 || person2X > SCREEN_WIDTH + 20) {
+        phase = 3;
+      }
+    } else if (phase == 3) { // Reset
+      phase = 0;
+      resetGame();
+    }
+  }
 }
